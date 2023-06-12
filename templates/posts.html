@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block post %}
+	<div class="post_title">
+		{{ title|rmdashes }}
+	</div>
+	<div class="post_date">
+		{{ date }}
+	</div>
+	<div class="post_body">
+		{{ body|markdown }}
+	</div>
+{% endblock post %}

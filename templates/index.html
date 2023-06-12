@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<title> {{ title }} </title>
+	</head>
+
+	<body>
+		<div class="links">
+			<ul>
+			{% for item in links %}
+				<li><a href="/post/{{ item}}">{{ item }}</a></li>
+			{% endfor %}
+		   </ul>
+		</div>
+	</body>
+</html>

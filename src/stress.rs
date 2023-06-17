@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clap::{arg, command, Parser};
 use htb::{BucketCfg, HTB};
 use parking_lot::Mutex;
 use reqwest::{Client, Request};
@@ -105,24 +106,49 @@ impl Throttler {
     }
 }
 
-const NUM_WORKERS: u16 = 32;
-
 const TOKEN_BUCKET_LABEL: usize = 0;
 const MIN_SLEEP_DURATION: Duration = Duration::from_millis(1);
-const BURST_DURATION: Duration = Duration::from_millis(50);
+
+fn parse_duration(arg: &str) -> Result<Duration, std::num::ParseIntError> {
+    let millis = arg.parse()?;
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+/// Stress test `blog-rs`
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    // Port the local server is running on.
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
+
+    /// Burst duration in milliseconds.
+    #[arg(long, value_parser = parse_duration, default_value = "10")]
+    burst_duration: Duration,
+
+    /// Number of async workers to spawn
+    #[arg(short, long, default_value_t = 32)]
+    num_workers: u16,
+
+    /// Target queries per second enforced by throttler
+    #[arg(long, default_value_t = 10000)]
+    qps: u64,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let rate = (50000, Duration::from_secs(1));
+    let args = Args::parse();
+    let port = args.port;
+    let rate = (args.qps, Duration::from_secs(1));
     let bucket_config = BucketCfg {
         this: TOKEN_BUCKET_LABEL,
         parent: None,
         rate,
-        capacity: calc_duration_capacity(rate, BURST_DURATION),
+        capacity: calc_duration_capacity(rate, args.burst_duration),
     };
 
     // won't achieve rate if we ever sleep without this property holding!
-    assert!(MIN_SLEEP_DURATION < BURST_DURATION);
+    assert!(MIN_SLEEP_DURATION < args.burst_duration);
 
     let token_bucket = HTB::new(&[bucket_config])?;
     let throttler = Arc::new(Throttler {
@@ -133,14 +159,16 @@ async fn main() -> anyhow::Result<()> {
     let client = Arc::new(Client::default());
     let request_base = Arc::new(
         client
-            .get("http://localhost:4000/post/Why-Apple-Vision-Pro-Is-Reasonably-Priced")
+            .get(format!(
+                "http://localhost:{port}/post/Why-Apple-Vision-Pro-Is-Reasonably-Priced"
+            ))
             .build()?,
     );
 
     let stats = Arc::new(Mutex::new(Stats::new()));
-    let mut workers = Vec::with_capacity(NUM_WORKERS.into());
+    let mut workers = Vec::with_capacity(args.num_workers.into());
 
-    for _ in 0..NUM_WORKERS {
+    for _ in 0..args.num_workers {
         let client = client.clone();
         let stats = stats.clone();
         let throttler = throttler.clone();

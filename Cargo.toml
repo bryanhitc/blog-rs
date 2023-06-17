@@ -17,6 +17,7 @@ path = "src/stress.rs"
 anyhow = "1"
 askama = {version="0.12.0", features=["markdown"]}
 axum =  "0.6.4"
+clap = { version = "4.3.3", features = ["derive"] }
 htb = "0.2.2"
 parking_lot = "0.12"
 reqwest = "0.11.18"

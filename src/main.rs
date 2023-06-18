@@ -151,7 +151,7 @@ fn main() {
         .route("/post/:query_title", get(post))
         .with_state(app_state)
         .nest_service("/assets", ServeDir::new("assets"));
-    axum::Server::bind(&"0.0.0.0:4000".parse().unwrap())
+    axum::Server::bind(&"0.0.0.0:8080".parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();

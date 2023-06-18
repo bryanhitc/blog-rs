@@ -20,6 +20,7 @@ axum =  "0.6.4"
 clap = { version = "4.3.3", features = ["derive"] }
 htb = "0.2.2"
 parking_lot = "0.12"
+quantiles = "0.7.1"
 reqwest = "0.11.18"
 tokio = {version="1.13.0", features = ["macros", "rt-multi-thread", "signal"]}
 tower-http = {version = "0.4", features=["full"]}

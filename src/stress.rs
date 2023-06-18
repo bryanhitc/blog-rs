@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -6,6 +7,7 @@ use std::{
 use clap::{arg, command, Parser};
 use htb::{BucketCfg, HTB};
 use parking_lot::Mutex;
+use quantiles::ckms::CKMS;
 use reqwest::{Client, Request};
 use tokio::task::JoinHandle;
 
@@ -15,6 +17,7 @@ struct Stats {
     updated_at: Instant,
     num_requests: u64,
     total_requests: u64,
+    total_latency_ckms: CKMS<f64>,
 }
 
 impl Stats {
@@ -25,6 +28,8 @@ impl Stats {
             updated_at: now,
             num_requests: 0,
             total_requests: 0,
+            // support up to p99.99
+            total_latency_ckms: CKMS::<f64>::new(0.0001),
         }
     }
 
@@ -42,22 +47,61 @@ impl Stats {
         true
     }
 
-    fn register_req(&mut self) {
+    fn write_latency_summary(&self, output: &mut String) -> anyhow::Result<()> {
+        output.write_str("Latency summary:\n")?;
+        self.write_quantile_str("p0", 0.0, output)?;
+        self.write_quantile_str("p10", 0.1, output)?;
+        self.write_quantile_str("p50", 0.5, output)?;
+        self.write_quantile_str("p90", 0.9, output)?;
+        self.write_quantile_str("p95", 0.95, output)?;
+        self.write_quantile_str("p99", 0.99, output)?;
+        self.write_quantile_str("p99.9", 0.999, output)?;
+        self.write_quantile_str("p99.99", 0.9999, output)?;
+        self.write_quantile_str("p100", 1.0, output)
+    }
+
+    fn write_quantile_str(
+        &self,
+        name: &str,
+        quantile: f64,
+        output: &mut String,
+    ) -> anyhow::Result<()> {
+        let quantile_latency = Duration::from_secs_f64(
+            self.total_latency_ckms
+                .query(quantile)
+                .ok_or_else(|| anyhow::format_err!("Unable to query quantile {}", quantile))?
+                .1,
+        );
+        output.write_fmt(format_args!("{name}: {:?}\n", quantile_latency))?;
+        Ok(())
+    }
+
+    fn register_req(&mut self, latency: Duration) {
         self.num_requests += 1;
         self.total_requests += 1;
+        self.total_latency_ckms.insert(latency.as_secs_f64());
     }
 }
 
 impl Drop for Stats {
     fn drop(&mut self) {
-        let now = Instant::now();
-        let time_diff = now - self.started_at;
-        println!(
-            "\n{} total requests in {:.02?}.\nAverage req/s: {:.02}",
-            self.total_requests,
-            time_diff,
-            self.total_requests as f64 / time_diff.as_secs_f64()
-        );
+        let elapsed = self.started_at.elapsed();
+        let mut output = String::new();
+        output
+            .write_fmt(format_args!(
+                "\n{} total requests in {:.02?}",
+                self.total_requests, elapsed
+            ))
+            .unwrap();
+        output
+            .write_fmt(format_args!(
+                "\nAverage req/s: {:.02?}",
+                self.total_requests as f64 / elapsed.as_secs_f64()
+            ))
+            .unwrap();
+        output.write_str("\n\n").unwrap();
+        self.write_latency_summary(&mut output).unwrap();
+        println!("{}", output);
     }
 }
 
@@ -208,16 +252,18 @@ async fn worker(
     throttler: Arc<Throttler>,
     request_base: Arc<Request>,
 ) -> anyhow::Result<()> {
-    let timeout = Duration::from_millis(100);
+    let timeout = Duration::from_secs(1);
     loop {
         while throttler.take_with_timeout(timeout).await {
             let request = request_base
                 .try_clone()
                 .ok_or_else(|| anyhow::format_err!("Unable to clone request"))?;
+            let start_time = Instant::now();
             client.execute(request).await?;
+            let latency = start_time.elapsed();
             {
                 let mut stats = stats.lock();
-                stats.register_req();
+                stats.register_req(latency);
                 stats.print_if_ready();
             }
         }

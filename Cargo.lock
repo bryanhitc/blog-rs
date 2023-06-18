@@ -252,6 +252,7 @@ dependencies = [
  "clap",
  "htb",
  "parking_lot",
+ "quantiles",
  "reqwest",
  "tokio",
  "tower-http",
@@ -1129,6 +1130,12 @@ checksum = "dec2b086b7a862cf4de201096214fa870344cf922b2b30c167badb3af3195406"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "quantiles"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c10fa813fb26fb6c321a6f3085b5ade4cb4730d08d0b9e70a3759136940957f2"
 
 [[package]]
 name = "quote"

@@ -11,17 +11,85 @@ use quantiles::ckms::CKMS;
 use reqwest::{Client, Request};
 use tokio::task::JoinHandle;
 
+trait MetricsRecorder {
+    fn new() -> Self;
+    fn record(&mut self, latency: Duration);
+    fn write_to_output(&self, output: &mut String) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct NoopMetricsRecorder {}
+impl MetricsRecorder for NoopMetricsRecorder {
+    fn new() -> Self {
+        NoopMetricsRecorder {}
+    }
+
+    fn record(&mut self, _latency: Duration) {}
+
+    fn write_to_output(&self, _output: &mut String) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
-struct Stats {
+struct ExpensiveMetricsRecorder {
+    total_latency_ckms: CKMS<f64>,
+}
+
+impl ExpensiveMetricsRecorder {
+    fn write_quantile_str(
+        &self,
+        name: &str,
+        quantile: f64,
+        output: &mut String,
+    ) -> anyhow::Result<()> {
+        let quantile_latency = Duration::from_secs_f64(
+            self.total_latency_ckms
+                .query(quantile)
+                .ok_or_else(|| anyhow::format_err!("Unable to query quantile {}", quantile))?
+                .1,
+        );
+        output.write_fmt(format_args!("{name}: {:?}\n", quantile_latency))?;
+        Ok(())
+    }
+}
+
+impl MetricsRecorder for ExpensiveMetricsRecorder {
+    fn new() -> Self {
+        Self {
+            total_latency_ckms: CKMS::<f64>::new(0.0001),
+        }
+    }
+
+    fn record(&mut self, latency: Duration) {
+        self.total_latency_ckms.insert(latency.as_secs_f64());
+    }
+
+    fn write_to_output(&self, output: &mut String) -> anyhow::Result<()> {
+        output.write_str("Latency summary:\n")?;
+        self.write_quantile_str("p0", 0.0, output)?;
+        self.write_quantile_str("p10", 0.1, output)?;
+        self.write_quantile_str("p50", 0.5, output)?;
+        self.write_quantile_str("p90", 0.9, output)?;
+        self.write_quantile_str("p95", 0.95, output)?;
+        self.write_quantile_str("p99", 0.99, output)?;
+        self.write_quantile_str("p99.9", 0.999, output)?;
+        self.write_quantile_str("p99.99", 0.9999, output)?;
+        self.write_quantile_str("p100", 1.0, output)
+    }
+}
+
+#[derive(Debug)]
+struct Stats<T: MetricsRecorder + Send> {
     started_at: Instant,
     updated_at: Instant,
     num_requests: u64,
     total_requests: u64,
-    total_latency_ckms: CKMS<f64>,
+    metrics_recorder: T,
 }
 
-impl Stats {
-    fn new() -> Stats {
+impl<T: MetricsRecorder + Send> Stats<T> {
+    fn new() -> Self {
         let now = Instant::now();
         Stats {
             started_at: now,
@@ -29,7 +97,7 @@ impl Stats {
             num_requests: 0,
             total_requests: 0,
             // support up to p99.99
-            total_latency_ckms: CKMS::<f64>::new(0.0001),
+            metrics_recorder: T::new(),
         }
     }
 
@@ -47,43 +115,14 @@ impl Stats {
         true
     }
 
-    fn write_latency_summary(&self, output: &mut String) -> anyhow::Result<()> {
-        output.write_str("Latency summary:\n")?;
-        self.write_quantile_str("p0", 0.0, output)?;
-        self.write_quantile_str("p10", 0.1, output)?;
-        self.write_quantile_str("p50", 0.5, output)?;
-        self.write_quantile_str("p90", 0.9, output)?;
-        self.write_quantile_str("p95", 0.95, output)?;
-        self.write_quantile_str("p99", 0.99, output)?;
-        self.write_quantile_str("p99.9", 0.999, output)?;
-        self.write_quantile_str("p99.99", 0.9999, output)?;
-        self.write_quantile_str("p100", 1.0, output)
-    }
-
-    fn write_quantile_str(
-        &self,
-        name: &str,
-        quantile: f64,
-        output: &mut String,
-    ) -> anyhow::Result<()> {
-        let quantile_latency = Duration::from_secs_f64(
-            self.total_latency_ckms
-                .query(quantile)
-                .ok_or_else(|| anyhow::format_err!("Unable to query quantile {}", quantile))?
-                .1,
-        );
-        output.write_fmt(format_args!("{name}: {:?}\n", quantile_latency))?;
-        Ok(())
-    }
-
     fn register_req(&mut self, latency: Duration) {
         self.num_requests += 1;
         self.total_requests += 1;
-        self.total_latency_ckms.insert(latency.as_secs_f64());
+        self.metrics_recorder.record(latency);
     }
 }
 
-impl Drop for Stats {
+impl<T: MetricsRecorder + Send> Drop for Stats<T> {
     fn drop(&mut self) {
         let elapsed = self.started_at.elapsed();
         let mut output = String::new();
@@ -100,7 +139,7 @@ impl Drop for Stats {
             ))
             .unwrap();
         output.write_str("\n\n").unwrap();
-        self.write_latency_summary(&mut output).unwrap();
+        self.metrics_recorder.write_to_output(&mut output).unwrap();
         println!("{}", output);
     }
 }
@@ -177,6 +216,10 @@ struct Args {
     /// Target queries per second enforced by throttler
     #[arg(long, default_value_t = 10000)]
     qps: u64,
+
+    // Record metrics (e.g., percentile latency)
+    #[arg(long, default_value_t = false)]
+    record_metrics: bool,
 }
 
 #[tokio::main]
@@ -200,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
         last_token_refresh: Mutex::new(Instant::now()),
     });
 
-    let client = Arc::new(Client::default());
+    let client = Client::default();
     let request_base = Arc::new(
         client
             .get(format!(
@@ -209,18 +252,18 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     );
 
-    let stats = Arc::new(Mutex::new(Stats::new()));
-    let mut workers = Vec::with_capacity(args.num_workers.into());
-
-    for _ in 0..args.num_workers {
-        let client = client.clone();
-        let stats = stats.clone();
-        let throttler = throttler.clone();
-        let request_base = request_base.clone();
-        workers.push(tokio::spawn(async move {
-            worker(client, stats, throttler, request_base).await
-        }));
-    }
+    // this would be so much cleaner with https://github.com/rust-lang/rust/issues/92827... sad.
+    // can't even create a closure to do this since closures don't support `impl Trait`.
+    // this is the price we pay to avoid a branch (that is essentially guaranteed to be predicted)...
+    let workers = {
+        if args.record_metrics {
+            let stats = Arc::new(Mutex::new(Stats::<ExpensiveMetricsRecorder>::new()));
+            create_workers(args.num_workers, client, stats, throttler, request_base)
+        } else {
+            let stats = Arc::new(Mutex::new(Stats::<NoopMetricsRecorder>::new()));
+            create_workers(args.num_workers, client, stats, throttler, request_base)
+        }
+    };
 
     tokio::select! {
         _ = run_workers(workers) => {
@@ -240,6 +283,26 @@ fn calc_duration_capacity(refill_rate: (u64, Duration), burst_duration: Duration
     f64::round(capacity) as u64
 }
 
+fn create_workers(
+    num_workers: u16,
+    client: Client,
+    stats: Arc<Mutex<Stats<impl MetricsRecorder + Send + 'static>>>,
+    throttler: Arc<Throttler>,
+    request_base: Arc<Request>,
+) -> Vec<JoinHandle<anyhow::Result<()>>> {
+    let mut workers = Vec::with_capacity(num_workers.into());
+    for _ in 0..num_workers {
+        let client = client.clone();
+        let stats = stats.clone();
+        let throttler = throttler.clone();
+        let request_base = request_base.clone();
+        workers.push(tokio::spawn(async move {
+            worker(client, stats, throttler, request_base).await
+        }));
+    }
+    workers
+}
+
 async fn run_workers(workers: Vec<JoinHandle<Result<(), anyhow::Error>>>) {
     for worker in workers {
         worker.await.unwrap().unwrap()
@@ -247,8 +310,8 @@ async fn run_workers(workers: Vec<JoinHandle<Result<(), anyhow::Error>>>) {
 }
 
 async fn worker(
-    client: Arc<Client>,
-    stats: Arc<Mutex<Stats>>,
+    client: Client,
+    stats: Arc<Mutex<Stats<impl MetricsRecorder + Send>>>,
     throttler: Arc<Throttler>,
     request_base: Arc<Request>,
 ) -> anyhow::Result<()> {
